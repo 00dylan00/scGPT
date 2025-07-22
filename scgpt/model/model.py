@@ -375,20 +375,29 @@ class TransformerModel(nn.Module):
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
         if CCE:
-            cell1 = cell_emb
+            cell1 = cell_emb    # computed from before
             transformer_output2 = self._encode(
                 src, values, src_key_padding_mask, batch_labels
-            )
-            cell2 = self._get_cell_emb_from_layer(transformer_output2)
-
+            )   # perform exactly the same encoding again - there is dropout in the Transformer 
+                # layers so the embeddings will be slightly different
+            cell2 = self._get_cell_emb_from_layer(transformer_output2)  # slightly different embeddings
+            """cell1 & cell2 are 2 views from the same imput - used as the positive pair
+            """
             # Gather embeddings from all devices if distributed training
+            # If we are using MULTIPLE GPUs at the same time we can retrieve embeddings
+            # from all GPUs and gather data from multiple devices to use in the contrastive loss
+            # Global contrastive loss therefore
             if dist.is_initialized() and self.training:
+                # create list of empty tensors to collect cell1 and cell2 embeddings 
+                # from all GPUs
                 cls1_list = [
                     torch.zeros_like(cell1) for _ in range(dist.get_world_size())
                 ]
                 cls2_list = [
                     torch.zeros_like(cell2) for _ in range(dist.get_world_size())
                 ]
+
+                # Perform all_gather to collect embeddings from all GPUs
                 dist.all_gather(tensor_list=cls1_list, tensor=cell1.contiguous())
                 dist.all_gather(tensor_list=cls2_list, tensor=cell2.contiguous())
 
@@ -401,8 +410,14 @@ class TransformerModel(nn.Module):
                 cell1 = torch.cat(cls1_list, dim=0)
                 cell2 = torch.cat(cls2_list, dim=0)
             # TODO: should detach the second run cls2? Can have a try
+            
+            # compute cosine similarity between cell1 and cell2
             cos_sim = self.sim(cell1.unsqueeze(1), cell2.unsqueeze(0))  # (batch, batch)
+            
+            # ground truth labels 0 . . . N
             labels = torch.arange(cos_sim.size(0)).long().to(cell1.device)
+            
+            # Apply cross entropy loss to the similarity matrix to compute contrastive loss
             output["loss_cce"] = self.creterion_cce(cos_sim, labels)
         if MVC:
             mvc_output = self.mvc_decoder(
