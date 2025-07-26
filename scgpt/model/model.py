@@ -1,5 +1,3 @@
-#replace: https://github.com/bowang-lab/scGPT/blob/main/scgpt/model/model.py
-
 import gc
 import math
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
@@ -9,10 +7,7 @@ import numpy as np
 from torch import nn, Tensor
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn import Linear, Dropout, LayerNorm, BatchNorm1d, ReLU, Embedding, Sequential, Identity, CosineSimilarity, LeakyReLU, Sigmoid
-#from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from .updated_torch_layers import TransformerEncoder, TransformerEncoderLayer
-#from .fast_transformers import TransformerEncoder, TransformerEncoderLayer
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.distributions import Bernoulli
 from tqdm import trange
 
@@ -42,7 +37,6 @@ class TransformerModel(nn.Module):
         n_cls: int = 1,
         vocab: Any = None,
         dropout: float = 0.5,
-        output_attentions = False,
         pad_token: str = "<pad>",
         pad_value: int = 0,
         do_mvc: bool = False,
@@ -70,7 +64,6 @@ class TransformerModel(nn.Module):
         self.input_emb_style = input_emb_style
         self.cell_emb_style = cell_emb_style
         self.explicit_zero_prob = explicit_zero_prob
-        self.output_attentions = output_attentions
         self.norm_scheme = "pre" if pre_norm else "post"
         if self.input_emb_style not in ["category", "continuous", "scaling"]:
             raise ValueError(
@@ -101,7 +94,7 @@ class TransformerModel(nn.Module):
                 n_input_bins, d_model, padding_idx=pad_value
             )
         else:
-            self.value_encoder = Identity()  # nn.Softmax(dim=1)
+            self.value_encoder = nn.Identity()  # nn.Softmax(dim=1)
             # TODO: consider row-wise normalization or softmax
             # TODO: Correct handle the mask_value when using scaling
 
@@ -117,7 +110,7 @@ class TransformerModel(nn.Module):
             )
         elif domain_spec_batchnorm == "batchnorm":
             print("Using simple batchnorm instead of domain specific batchnorm")
-            self.bn = BatchNorm1d(d_model, eps=6.1e-5)
+            self.bn = nn.BatchNorm1d(d_model, eps=6.1e-5)
 
         if use_fast_transformer:
             if fast_transformer_backend == "linear":
@@ -135,11 +128,10 @@ class TransformerModel(nn.Module):
                 )
                 self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
         else:
-            print("Not using use fast transformer")
             encoder_layers = TransformerEncoderLayer(
-                d_model, nhead, d_hid, dropout, batch_first=True, output_attentions = self.output_attentions
+                d_model, nhead, d_hid, dropout, batch_first=True
             )
-            self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers, output_attentions = self.output_attentions)
+            self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
 
         self.decoder = ExprDecoder(
             d_model,
@@ -166,7 +158,6 @@ class TransformerModel(nn.Module):
         self.creterion_cce = nn.CrossEntropyLoss()
 
         self.init_weights()
-
 
     def init_weights(self) -> None:
         initrange = 0.1
@@ -199,21 +190,11 @@ class TransformerModel(nn.Module):
             )  # the batch norm always works on dim 1
         elif getattr(self, "bn", None) is not None:
             total_embs = self.bn(total_embs.permute(0, 2, 1)).permute(0, 2, 1)
-        transformer_output = self.transformer_encoder(
+
+        output = self.transformer_encoder(
             total_embs, src_key_padding_mask=src_key_padding_mask
         )
-        # Handle various tuple formats
-        if isinstance(transformer_output, tuple):
-            if len(transformer_output) == 1:
-                output = transformer_output[0]
-                attns = None
-            else:  # len >= 2
-                output, attns = transformer_output[0], transformer_output[1]
-        else:
-            output = transformer_output
-            attns = None
-
-        return output, attns  # (batch, seq_len, embsize)
+        return output  # (batch, seq_len, embsize)
 
     def _get_cell_emb_from_layer(
         self, layer_output: Tensor, weights: Tensor = None
@@ -240,7 +221,6 @@ class TransformerModel(nn.Module):
             cell_emb = F.normalize(cell_emb, p=2, dim=1)  # (batch, embsize)
 
         return cell_emb
-
 
     def _check_batch_labels(self, batch_labels: Tensor) -> None:
         if self.use_batch_labels or self.domain_spec_batchnorm:
@@ -309,21 +289,9 @@ class TransformerModel(nn.Module):
             src_key_padding_mask = torch.zeros(
                 total_embs.shape[:2], dtype=torch.bool, device=total_embs.device
             )
-
         transformer_output = self.transformer_encoder(
             total_embs, src_key_padding_mask=src_key_padding_mask
         )
-        # Handle various tuple formats
-        if isinstance(transformer_output, tuple):
-            if len(transformer_output) == 1:
-                output = transformer_output[0]
-                attns = None
-            else:  # len >= 2
-                output, attns = transformer_output[0], transformer_output[1]
-        else:
-            output = transformer_output
-            attns = None
-
 
         if self.use_batch_labels:
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
@@ -374,28 +342,13 @@ class TransformerModel(nn.Module):
         Returns:
             dict of output Tensors.
         """
-        output = {}
-
         transformer_output = self._encode(
             src, values, src_key_padding_mask, batch_labels
         )
-        # Handle various tuple formats
-        if isinstance(transformer_output, tuple):
-            if len(transformer_output) == 1:
-                output = transformer_output[0]
-                attns = None
-            else:  # len >= 2
-                output, attns = transformer_output[0], transformer_output[1]
-                if attns:
-                    output["attentions"] = attns
-        else:
-            output = transformer_output
-            attns = None 
-
-
         if self.use_batch_labels:
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
 
+        output = {}
         mlm_output = self.decoder(
             transformer_output
             if not self.use_batch_labels
@@ -422,20 +375,29 @@ class TransformerModel(nn.Module):
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
         if CCE:
-            cell1 = cell_emb
+            cell1 = cell_emb    # computed from before
             transformer_output2 = self._encode(
                 src, values, src_key_padding_mask, batch_labels
-            )
-            cell2 = self._get_cell_emb_from_layer(transformer_output2)
-
+            )   # perform exactly the same encoding again - there is dropout in the Transformer 
+                # layers so the embeddings will be slightly different
+            cell2 = self._get_cell_emb_from_layer(transformer_output2)  # slightly different embeddings
+            """cell1 & cell2 are 2 views from the same imput - used as the positive pair
+            """
             # Gather embeddings from all devices if distributed training
+            # If we are using MULTIPLE GPUs at the same time we can retrieve embeddings
+            # from all GPUs and gather data from multiple devices to use in the contrastive loss
+            # Global contrastive loss therefore
             if dist.is_initialized() and self.training:
+                # create list of empty tensors to collect cell1 and cell2 embeddings 
+                # from all GPUs
                 cls1_list = [
                     torch.zeros_like(cell1) for _ in range(dist.get_world_size())
                 ]
                 cls2_list = [
                     torch.zeros_like(cell2) for _ in range(dist.get_world_size())
                 ]
+
+                # Perform all_gather to collect embeddings from all GPUs
                 dist.all_gather(tensor_list=cls1_list, tensor=cell1.contiguous())
                 dist.all_gather(tensor_list=cls2_list, tensor=cell2.contiguous())
 
@@ -448,8 +410,14 @@ class TransformerModel(nn.Module):
                 cell1 = torch.cat(cls1_list, dim=0)
                 cell2 = torch.cat(cls2_list, dim=0)
             # TODO: should detach the second run cls2? Can have a try
+            
+            # compute cosine similarity between cell1 and cell2
             cos_sim = self.sim(cell1.unsqueeze(1), cell2.unsqueeze(0))  # (batch, batch)
+            
+            # ground truth labels 0 . . . N
             labels = torch.arange(cos_sim.size(0)).long().to(cell1.device)
+            
+            # Apply cross entropy loss to the similarity matrix to compute contrastive loss
             output["loss_cce"] = self.creterion_cce(cos_sim, labels)
         if MVC:
             mvc_output = self.mvc_decoder(
@@ -545,6 +513,7 @@ class TransformerModel(nn.Module):
 
         return outputs
 
+
 def generate_square_subsequent_mask(sz: int) -> Tensor:
     """Generates an upper-triangular matrix of -inf, with zeros on diag."""
     return torch.triu(torch.ones(sz, sz) * float("-inf"), diagonal=1)
@@ -568,7 +537,7 @@ class FastTransformerEncoderWrapper(nn.Module):
     def build_fast_transformer_encoder(
         d_model: int, nhead: int, d_hid: int, nlayers: int, dropout: float
     ) -> nn.Module:
-        from .fast_transformers.transformers import TransformerEncoderBuilder
+        from fast_transformers.builders import TransformerEncoderBuilder
 
         if d_model % nhead != 0:
             raise ValueError(
@@ -588,7 +557,6 @@ class FastTransformerEncoderWrapper(nn.Module):
         )
         assert builder.attention_type == "linear"
         return builder.get()
-
 
     @staticmethod
     def build_length_mask(
@@ -637,7 +605,7 @@ class FastTransformerEncoderWrapper(nn.Module):
         length_mask = self.build_length_mask(src, src_key_padding_mask)
         output = self.fast_transformer_encoder(src, length_mask=length_mask)
         return output
-        
+
 
 class FlashTransformerEncoderLayer(nn.Module):
     r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
@@ -692,14 +660,14 @@ class FlashTransformerEncoderLayer(nn.Module):
         if not hasattr(self.self_attn, "batch_first"):
             self.self_attn.batch_first = batch_first
         # Implementation of Feedforward model
-        self.linear1 = Linear(d_model, dim_feedforward, **factory_kwargs)
-        self.dropout = Dropout(dropout)
-        self.linear2 = Linear(dim_feedforward, d_model, **factory_kwargs)
+        self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
 
-        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
-        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
-        self.dropout1 = Dropout(dropout)
-        self.dropout2 = Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
         self.activation = self._get_activation_fn(activation)
         self.norm_scheme = norm_scheme
@@ -775,22 +743,21 @@ class GeneEncoder(nn.Module):
         padding_idx: Optional[int] = None,
     ):
         super().__init__()
-        self.embedding = torch.nn.Embedding(
+        self.embedding = nn.Embedding(
             num_embeddings, embedding_dim, padding_idx=padding_idx
         )
-        self.enc_norm = LayerNorm(embedding_dim)
+        self.enc_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        print("Inside GeneEncoder, x is of type:", x.dtype)
         x = self.embedding(x)  # (batch, seq_len, embsize)
-        x = self.enc_norm(x.float())
+        x = self.enc_norm(x)
         return x
 
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
-        self.dropout = Dropout(p=dropout)
+        self.dropout = nn.Dropout(p=dropout)
 
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(
@@ -817,11 +784,11 @@ class ContinuousValueEncoder(nn.Module):
 
     def __init__(self, d_model: int, dropout: float = 0.1, max_value: int = 512):
         super().__init__()
-        self.dropout = Dropout(p=dropout)
-        self.linear1 = Linear(1, d_model)
-        self.activation = ReLU()
-        self.linear2 = Linear(d_model, d_model)
-        self.norm = LayerNorm(d_model)
+        self.dropout = nn.Dropout(p=dropout)
+        self.linear1 = nn.Linear(1, d_model)
+        self.activation = nn.ReLU()
+        self.linear2 = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
         self.max_value = max_value
 
     def forward(self, x: Tensor) -> Tensor:
@@ -848,10 +815,10 @@ class CategoryValueEncoder(nn.Module):
         padding_idx: Optional[int] = None,
     ):
         super().__init__()
-        self.embedding = Embedding(
+        self.embedding = nn.Embedding(
             num_embeddings, embedding_dim, padding_idx=padding_idx
         )
-        self.enc_norm = LayerNorm(embedding_dim)
+        self.enc_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x.long()
@@ -868,10 +835,10 @@ class BatchLabelEncoder(nn.Module):
         padding_idx: Optional[int] = None,
     ):
         super().__init__()
-        self.embedding = Embedding(
+        self.embedding = nn.Embedding(
             num_embeddings, embedding_dim, padding_idx=padding_idx
         )
-        self.enc_norm = LayerNorm(embedding_dim)
+        self.enc_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.embedding(x)  # (batch, embsize)
@@ -887,7 +854,7 @@ class Similarity(nn.Module):
     def __init__(self, temp):
         super().__init__()
         self.temp = temp
-        self.cos = CosineSimilarity(dim=-1)
+        self.cos = nn.CosineSimilarity(dim=-1)
 
     def forward(self, x, y):
         return self.cos(x, y) / self.temp
@@ -902,28 +869,25 @@ class ExprDecoder(nn.Module):
     ):
         super().__init__()
         d_in = d_model * 2 if use_batch_labels else d_model
-        self.fc = Sequential(
-            Linear(d_in, d_model),
-            LeakyReLU(),
-            Linear(d_model, d_model),
-            LeakyReLU(),
-            Linear(d_model, 1),
+        self.fc = nn.Sequential(
+            nn.Linear(d_in, d_model),
+            nn.LeakyReLU(),
+            nn.Linear(d_model, d_model),
+            nn.LeakyReLU(),
+            nn.Linear(d_model, 1),
         )
         self.explicit_zero_prob = explicit_zero_prob
         if explicit_zero_prob:
-            self.zero_logit = Sequential(
-                Linear(d_in, d_model),
-                LeakyReLU(),
-                Linear(d_model, d_model),
-                LeakyReLU(),
-                Linear(d_model, 1),
+            self.zero_logit = nn.Sequential(
+                nn.Linear(d_in, d_model),
+                nn.LeakyReLU(),
+                nn.Linear(d_model, d_model),
+                nn.LeakyReLU(),
+                nn.Linear(d_model, 1),
             )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """x is the output of the transformer, (batch, seq_len, d_model)"""
-        print(f"x is of type: {x.dtype}")
-        print(f"x is of shape: {x.shape}")
-        print(f"x at position 1 is of type: {x[1].dtype}")
         pred_value = self.fc(x).squeeze(-1)  # (batch, seq_len)
 
         if not self.explicit_zero_prob:
@@ -948,16 +912,16 @@ class ClsDecoder(nn.Module):
         d_model: int,
         n_cls: int,
         nlayers: int = 3,
-        activation: callable = ReLU,
+        activation: callable = nn.ReLU,
     ):
         super().__init__()
         # module list
         self._decoder = nn.ModuleList()
         for i in range(nlayers - 1):
-            self._decoder.append(Linear(d_model, d_model))
+            self._decoder.append(nn.Linear(d_model, d_model))
             self._decoder.append(activation())
-            self._decoder.append(LayerNorm(d_model))
-        self.out_layer = Linear(d_model, n_cls)
+            self._decoder.append(nn.LayerNorm(d_model))
+        self.out_layer = nn.Linear(d_model, n_cls)
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -978,8 +942,8 @@ class MVCDecoder(nn.Module):
         self,
         d_model: int,
         arch_style: str = "inner product",
-        query_activation: nn.Module = Sigmoid,
-        hidden_activation: nn.Module = ReLU,
+        query_activation: nn.Module = nn.Sigmoid,
+        hidden_activation: nn.Module = nn.PReLU,
         explicit_zero_prob: bool = False,
         use_batch_labels: bool = False,
     ) -> None:
@@ -996,23 +960,23 @@ class MVCDecoder(nn.Module):
         super().__init__()
         d_in = d_model * 2 if use_batch_labels else d_model
         if arch_style in ["inner product", "inner product, detach"]:
-            self.gene2query = Linear(d_model, d_model)
+            self.gene2query = nn.Linear(d_model, d_model)
             self.query_activation = query_activation()
-            self.W = Linear(d_model, d_in, bias=False)
+            self.W = nn.Linear(d_model, d_in, bias=False)
             if explicit_zero_prob:  # by default, gene-wise prob rate
-                self.W_zero_logit = Linear(d_model, d_in)
+                self.W_zero_logit = nn.Linear(d_model, d_in)
         elif arch_style == "concat query":
-            self.gene2query = Linear(d_model, 64)
+            self.gene2query = nn.Linear(d_model, 64)
             self.query_activation = query_activation()
-            self.fc1 = Linear(d_model + 64, 64)
+            self.fc1 = nn.Linear(d_model + 64, 64)
             self.hidden_activation = hidden_activation()
-            self.fc2 = Linear(64, 1)
+            self.fc2 = nn.Linear(64, 1)
         elif arch_style == "sum query":
-            self.gene2query = Linear(d_model, d_model)
+            self.gene2query = nn.Linear(d_model, d_model)
             self.query_activation = query_activation()
-            self.fc1 = Linear(d_model, 64)
+            self.fc1 = nn.Linear(d_model, 64)
             self.hidden_activation = hidden_activation()
-            self.fc2 = Linear(64, 1)
+            self.fc2 = nn.Linear(64, 1)
         else:
             raise ValueError(f"Unknown arch_style: {arch_style}")
 
@@ -1071,17 +1035,17 @@ class AdversarialDiscriminator(nn.Module):
         d_model: int,
         n_cls: int,
         nlayers: int = 3,
-        activation: callable = LeakyReLU,
+        activation: callable = nn.LeakyReLU,
         reverse_grad: bool = False,
     ):
         super().__init__()
         # module list
         self._decoder = nn.ModuleList()
         for i in range(nlayers - 1):
-            self._decoder.append(Linear(d_model, d_model))
+            self._decoder.append(nn.Linear(d_model, d_model))
             self._decoder.append(activation())
-            self._decoder.append(LayerNorm(d_model))
-        self.out_layer = Linear(d_model, n_cls)
+            self._decoder.append(nn.LayerNorm(d_model))
+        self.out_layer = nn.Linear(d_model, n_cls)
         self.reverse_grad = reverse_grad
 
     def forward(self, x: Tensor) -> Tensor:
